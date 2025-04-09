@@ -1,0 +1,224 @@
+name: WhatsApp Integration Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      remote_endpoint:
+        description: 'Remote browser endpoint (ws://...)'
+        required: true
+        type: string
+      storage_bucket:
+        description: 'Firebase storage bucket name'
+        required: true
+        type: string
+      phone_number:
+        description: 'WhatsApp number to test'
+        required: true
+        type: string
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Authenticate with Firebase
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
+    
+    - name: Write credentials
+      run: |
+        echo "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}" > /tmp/firebase-credentials.json
+    
+    - name: Create config and test file
+      run: |
+        cat > config.js << 'EOF'
+        module.exports = {
+          phoneNumber: "${{ github.event.inputs.phone_number }}",
+          testMessage: "Tell me a joke about automated testing",
+          waitTime: 60000, // 1 minute max wait time for response
+        };
+        EOF
+        
+        cat > integration-test.js << 'EOF'
+        const { Client, RemoteAuth } = require("whatsapp-web.js");
+        const admin = require("firebase-admin");
+        const config = require("./config");
+        
+        // Firebase setup with service account
+        admin.initializeApp({
+          credential: admin.credential.applicationDefault(),
+          storageBucket: "${{ github.event.inputs.storage_bucket }}"
+        });
+        
+        const bucket = admin.storage().bucket();
+        
+        // Firebase storage adapter for RemoteAuth
+        class FirebaseStorageAdapter {
+          constructor(bucket) {
+            this.bucket = bucket;
+          }
+        
+          async set(key, value) {
+            const file = this.bucket.file(key);
+            await file.save(JSON.stringify(value));
+          }
+        
+          async get(key) {
+            const file = this.bucket.file(key);
+            try {
+              const [data] = await file.download();
+              return JSON.parse(data.toString());
+            } catch (error) {
+              if (error.code === 404) return null; // File not found
+              throw error;
+            }
+          }
+        
+          async delete(key) {
+            const file = this.bucket.file(key);
+            await file.delete({ ignoreNotFound: true });
+          }
+        
+          async getAll() {
+            const [files] = await this.bucket.getFiles();
+            const sessions = [];
+            for (const file of files) {
+              const key = file.name;
+              const [data] = await file.download();
+              sessions.push({ key, data: JSON.parse(data.toString()) });
+            }
+            return sessions;
+          }
+          
+          // Required for RemoteAuth
+          async sessionExists(options) {
+            const { session } = options;
+            try {
+              const file = this.bucket.file(session);
+              const [exists] = await file.exists();
+              return exists;
+            } catch (error) {
+              console.error('Error checking if session exists:', error);
+              return false;
+            }
+          }
+        }
+        
+        const firebaseStorage = new FirebaseStorageAdapter(bucket);
+        
+        async function runTest() {
+          console.log("Starting WhatsApp integration test");
+          
+          // Initialize WhatsApp client
+          console.log("Initializing WhatsApp client with remote browser");
+          const client = new Client({
+            authStrategy: new RemoteAuth({
+              clientId: "whatsapp-test-bot",
+              store: firebaseStorage,
+              backupSyncIntervalMs: 300000 // 5 minutes
+            }),
+            puppeteer: {
+              browserWSEndpoint: "${{ github.event.inputs.remote_endpoint }}",
+            },
+          });
+          
+          let testPassed = false;
+          let timeoutId;
+          
+          // Set up timeout
+          const timeout = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+              reject(new Error("Test timed out waiting for response"));
+            }, config.waitTime);
+          });
+          
+          // Set up test completion
+          const testResult = new Promise((resolve) => {
+            // Handle QR code (shouldn't happen if auth is working)
+            client.on("qr", (qr) => {
+              console.log("QR RECEIVED. This indicates the RemoteAuth is not working!");
+              console.log("QR code:", qr);
+              // Don't exit immediately - give it a chance to authenticate if manual scan occurs
+            });
+            
+            client.on("ready", async () => {
+              console.log("WhatsApp client is ready - RemoteAuth successful!");
+              
+              try {
+                // Get test contact
+                console.log(`Finding chat for number: ${config.phoneNumber}`);
+                const numberWithSuffix = `${config.phoneNumber}@c.us`;
+                const chat = await client.getChatById(numberWithSuffix);
+                
+                if (!chat) {
+                  throw new Error(`Could not find chat for ${config.phoneNumber}`);
+                }
+                
+                console.log("Found chat, sending test message");
+                await chat.sendMessage(config.testMessage);
+                console.log("Test message sent, waiting for response...");
+                
+                // Listen for incoming messages
+                client.on("message", async (message) => {
+                  if (message.from === numberWithSuffix) {
+                    console.log("Received response:", message.body);
+                    testPassed = true;
+                    clearTimeout(timeoutId);
+                    
+                    // Wait a moment to ensure message is fully processed
+                    setTimeout(() => {
+                      client.destroy();
+                      resolve(true);
+                    }, 1000);
+                  }
+                });
+              } catch (error) {
+                console.error("Error in test:", error);
+                client.destroy();
+                resolve(false);
+              }
+            });
+          });
+          
+          // Initialize client
+          await client.initialize();
+          
+          // Wait for either test completion or timeout
+          try {
+            await Promise.race([testResult, timeout]);
+            return testPassed;
+          } catch (error) {
+            console.error(error.message);
+            client.destroy();
+            return false;
+          }
+        }
+        
+        runTest()
+          .then((passed) => {
+            console.log(passed ? "✅ Integration test passed!" : "❌ Integration test failed!");
+            process.exit(passed ? 0 : 1);
+          })
+          .catch((error) => {
+            console.error("Integration test error:", error);
+            process.exit(1);
+          });
+        EOF
+    
+    - name: Run integration test
+      env:
+        GOOGLE_APPLICATION_CREDENTIALS: /tmp/firebase-credentials.json
+      run: |
+        node integration-test.js
