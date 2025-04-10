@@ -1,7 +1,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const dotenv = require('dotenv');
-const { litellm } = require('litellm');
+const litellm = require('litellm');
 
 // Load environment variables
 dotenv.config();
